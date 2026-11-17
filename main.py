@@ -55,14 +55,33 @@ def round2(x: float) -> float | int:
     whole = math.floor(scaled)
     if scaled - whole >= 0.5:
         whole += 1
-    val = whole / 100
+    val = round(whole / 100, 2)
     return int(val) if val.is_integer() else val
 
 
+def bound_quantile(v: float) -> float | int:
+    """Bound quantile to valid range (0, 1e9], non-zero positive, rounded to 2 decimals."""
+    if not math.isfinite(v) or v < 0.01:
+        v = 0.01
+    elif v > 1e9:
+        v = 1e9
+    res = round2(v)
+    if res <= 0:
+        res = 0.01
+    elif res > 1e9:
+        res = 1_000_000_000
+    return res
+
+
 def extract_comparable_log_ratios(case: dict) -> dict[int, list[float]]:
-    """Extract valid launch-day hourly log-ratios from comparables."""
+    """Extract valid launch-day hourly log-ratios from comparables.
+
+    Prioritizes rolling midnight-local releases matching GTA VI's launch structure.
+    Falls back to general comparables if insufficient rolling releases are available.
+    """
     comparables = case.get("comparables", [])
-    hourly_log_ratios: dict[int, list[float]] = {h: [] for h in range(2, 25)}
+    rolling_ratios: dict[int, list[float]] = {h: [] for h in range(2, 25)}
+    general_ratios: dict[int, list[float]] = {h: [] for h in range(2, 25)}
 
     for comp in comparables:
         day_start_str = comp.get("day_start")
@@ -93,12 +112,22 @@ def extract_comparable_log_ratios(case: dict) -> dict[int, list[float]]:
                 break
 
         if valid:
-            weight = 3 if is_rolling else 1
             for h in range(2, 25):
-                for _ in range(weight):
-                    hourly_log_ratios[h].append(curve[h])
+                if is_rolling:
+                    rolling_ratios[h].append(curve[h])
+                else:
+                    general_ratios[h].append(curve[h])
 
-    return hourly_log_ratios
+    # If rolling curves are present across the day, use them to avoid simultaneous-release artifacts
+    hours_with_rolling = sum(1 for h in range(2, 25) if len(rolling_ratios[h]) >= 3)
+    if hours_with_rolling == 23:
+        return rolling_ratios
+
+    # Fall back to combined sample
+    combined: dict[int, list[float]] = {h: [] for h in range(2, 25)}
+    for h in range(2, 25):
+        combined[h] = rolling_ratios[h] + general_ratios[h]
+    return combined
 
 
 def forecast_case(case: dict, filename: str) -> dict:
@@ -110,32 +139,44 @@ def forecast_case(case: dict, filename: str) -> dict:
     if first_hour is None:
         raise ValueError(f"{filename} has no hour-1 print")
 
-    p1 = max(1, first_hour.get("viewers", 1))
+    v1 = first_hour.get("viewers")
+    p1 = max(1.0, float(v1)) if v1 is not None else 1.0
     extracted = extract_comparable_log_ratios(case)
 
     hours_output = []
-    for row in case.get("forecast", []):
+    forecast_rows = case.get("forecast", [])
+    if not forecast_rows:
+        forecast_rows = [{"hour": h} for h in range(2, 25)]
+
+    for row in forecast_rows:
         h = row.get("hour")
         prior_mean, prior_std = DEFAULT_PRIORS.get(h, (0.0, 0.15 * math.sqrt(h - 1)))
 
         sample = extracted.get(h, [])
-        if len(sample) >= 5:
-            sample_mean = sum(sample) / len(sample)
-            sample_var = sum((s - sample_mean) ** 2 for s in sample) / (len(sample) - 1)
+        n = len(sample)
+        if n >= 3:
+            sample_mean = sum(sample) / n
+            sample_var = sum((s - sample_mean) ** 2 for s in sample) / (n - 1)
             sample_std = max(0.1, math.sqrt(sample_var))
 
-            # Bayesian shrinkage towards established prior
-            weight_sample = min(1.0, len(sample) / 20.0)
+            # Empirical Bayes shrinkage towards calibrated diurnal prior (N0 = 10 pseudo-observations)
+            N0 = 10.0
+            weight_sample = n / (n + N0)
             mu = weight_sample * sample_mean + (1.0 - weight_sample) * prior_mean
             sigma = weight_sample * sample_std + (1.0 - weight_sample) * prior_std
         else:
             mu = prior_mean
             sigma = prior_std
 
-        # Compute quantiles: q_tau = p1 * exp(mu + z_tau * sigma), bounded to valid range
-        quantiles = [max(0.01, min(1e9, round2(p1 * math.exp(mu + z * sigma)))) for z in Z]
+        sigma = max(0.05, min(2.0, sigma))
 
-        # Enforce non-decreasing monotonicity
+        # Compute quantiles: q_tau = p1 * exp(mu + z_tau * sigma), strictly bounded and rounded
+        quantiles = [
+            bound_quantile(p1 * math.exp(max(-50.0, min(50.0, mu + z * sigma))))
+            for z in Z
+        ]
+
+        # Enforce strict non-decreasing monotonicity: q05 <= q25 <= q50 <= q75 <= q95
         for i in range(1, len(quantiles)):
             if quantiles[i] < quantiles[i - 1]:
                 quantiles[i] = quantiles[i - 1]
