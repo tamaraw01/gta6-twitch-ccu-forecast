@@ -1,201 +1,2 @@
-"""Forecast GTA VI launch-day Twitch CCU hour by hour for make.fun.
-
-This model predicts the 24-hour concurrent viewer trajectory of GTA VI on Twitch
-(category 1867279146) from hour 1 print (p1) using an empirical diurnal log-ratio
-distribution modeled from comparable AAA midnight-local release curves.
-"""
-
-import json
-import math
-import os
-import sys
-from datetime import datetime, timedelta
-from pathlib import Path
-
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-
-INPUT_DIR = Path(os.environ.get("MAKEFUN_INPUT_DIR", "/input"))
-OUTPUT_DIR = Path(os.environ.get("MAKEFUN_OUTPUT_DIR", "/output"))
-
-LEVELS = [0.05, 0.25, 0.5, 0.75, 0.95]
-Z = [-1.645, -0.674, 0.0, 0.674, 1.645]
-
-# Calibrated prior parameters for hourly log-ratio relative to hour 1 (hours 2..24).
-# Based on historical rolling-release AAA game launch curves on Twitch.
-DEFAULT_PRIORS = {
-    2:  (-0.112, 0.180),
-    3:  (-0.333, 0.320),
-    4:  (-0.386, 0.320),
-    5:  (-0.211, 0.350),
-    6:  ( 0.019, 0.480),
-    7:  ( 0.041, 0.550),
-    8:  ( 0.018, 0.580),
-    9:  (-0.028, 0.600),
-    10: (-0.032, 0.600),
-    11: (-0.007, 0.600),
-    12: ( 0.055, 0.600),
-    13: ( 0.195, 0.600),
-    14: ( 0.338, 0.600),
-    15: ( 0.455, 0.600),
-    16: ( 0.530, 0.600),
-    17: ( 0.607, 0.600),
-    18: ( 0.668, 0.620),
-    19: ( 0.717, 0.640),
-    20: ( 0.729, 0.650),
-    21: ( 0.735, 0.640),
-    22: ( 0.707, 0.630),
-    23: ( 0.646, 0.620),
-    24: ( 0.546, 0.640),
-}
-
-
-def round2(x: float) -> float | int:
-    """Round to 2 decimal places half-up matching JavaScript Math.round."""
-    scaled = x * 100
-    whole = math.floor(scaled)
-    if scaled - whole >= 0.5:
-        whole += 1
-    val = round(whole / 100, 2)
-    return int(val) if val.is_integer() else val
-
-
-def bound_quantile(v: float) -> float | int:
-    """Bound quantile to valid range (0, 1e9], non-zero positive, rounded to 2 decimals."""
-    if not math.isfinite(v) or v < 0.01:
-        v = 0.01
-    elif v > 1e9:
-        v = 1e9
-    res = round2(v)
-    if res <= 0:
-        res = 0.01
-    elif res > 1e9:
-        res = 1_000_000_000
-    return res
-
-
-def extract_comparable_log_ratios(case: dict) -> dict[int, list[float]]:
-    """Extract valid launch-day hourly log-ratios from comparables.
-
-    Prioritizes rolling midnight-local releases matching GTA VI's launch structure.
-    Falls back to general comparables if insufficient rolling releases are available.
-    """
-    comparables = case.get("comparables", [])
-    rolling_ratios: dict[int, list[float]] = {h: [] for h in range(2, 25)}
-    general_ratios: dict[int, list[float]] = {h: [] for h in range(2, 25)}
-
-    for comp in comparables:
-        day_start_str = comp.get("day_start")
-        if not day_start_str:
-            continue
-        try:
-            dt_start = datetime.fromisoformat(day_start_str.replace("Z", "+00:00"))
-        except Exception:
-            continue
-
-        pts = {p.get("from"): p.get("viewers") for p in comp.get("hourly", [])}
-        h1 = pts.get(day_start_str)
-        if not h1 or h1 < 1000:
-            continue
-
-        unlock = str(comp.get("unlock", "")).lower()
-        is_rolling = "rolling" in unlock or "midnight local" in unlock
-
-        curve: dict[int, float] = {}
-        valid = True
-        for h in range(2, 25):
-            t_str = (dt_start + timedelta(hours=h - 1)).strftime("%Y-%m-%dT%H:%M:%SZ")
-            v = pts.get(t_str)
-            if v is not None and v > 0:
-                curve[h] = math.log(v / h1)
-            else:
-                valid = False
-                break
-
-        if valid:
-            for h in range(2, 25):
-                if is_rolling:
-                    rolling_ratios[h].append(curve[h])
-                else:
-                    general_ratios[h].append(curve[h])
-
-    # If rolling curves are present across the day, use them to avoid simultaneous-release artifacts
-    hours_with_rolling = sum(1 for h in range(2, 25) if len(rolling_ratios[h]) >= 3)
-    if hours_with_rolling == 23:
-        return rolling_ratios
-
-    # Fall back to combined sample
-    combined: dict[int, list[float]] = {h: [] for h in range(2, 25)}
-    for h in range(2, 25):
-        combined[h] = rolling_ratios[h] + general_ratios[h]
-    return combined
-
-
-def forecast_case(case: dict, filename: str) -> dict:
-    if case.get("levels") != LEVELS:
-        raise ValueError(f"{filename} asks for levels {case.get('levels')}, expected {LEVELS}")
-
-    known = case.get("known", [])
-    first_hour = next((k for k in known if k.get("hour") == 1), None)
-    if first_hour is None:
-        raise ValueError(f"{filename} has no hour-1 print")
-
-    v1 = first_hour.get("viewers")
-    p1 = max(1.0, float(v1)) if v1 is not None else 1.0
-    extracted = extract_comparable_log_ratios(case)
-
-    hours_output = []
-    forecast_rows = case.get("forecast", [])
-    if not forecast_rows:
-        forecast_rows = [{"hour": h} for h in range(2, 25)]
-
-    for row in forecast_rows:
-        h = row.get("hour")
-        prior_mean, prior_std = DEFAULT_PRIORS.get(h, (0.0, 0.15 * math.sqrt(h - 1)))
-
-        sample = extracted.get(h, [])
-        n = len(sample)
-        if n >= 3:
-            sample_mean = sum(sample) / n
-            sample_var = sum((s - sample_mean) ** 2 for s in sample) / (n - 1)
-            sample_std = max(0.1, math.sqrt(sample_var))
-
-            # Empirical Bayes shrinkage towards calibrated diurnal prior (N0 = 10 pseudo-observations)
-            N0 = 10.0
-            weight_sample = n / (n + N0)
-            mu = weight_sample * sample_mean + (1.0 - weight_sample) * prior_mean
-            sigma = weight_sample * sample_std + (1.0 - weight_sample) * prior_std
-        else:
-            mu = prior_mean
-            sigma = prior_std
-
-        sigma = max(0.05, min(2.0, sigma))
-
-        # Compute quantiles: q_tau = p1 * exp(mu + z_tau * sigma), strictly bounded and rounded
-        quantiles = [
-            bound_quantile(p1 * math.exp(max(-50.0, min(50.0, mu + z * sigma))))
-            for z in Z
-        ]
-
-        # Enforce strict non-decreasing monotonicity: q05 <= q25 <= q50 <= q75 <= q95
-        for i in range(1, len(quantiles)):
-            if quantiles[i] < quantiles[i - 1]:
-                quantiles[i] = quantiles[i - 1]
-
-        hours_output.append({"hour": h, "q": quantiles})
-
-    return {"hours": hours_output}
-
-
-def main() -> None:
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    case_paths = sorted(INPUT_DIR.glob("*.in"))
-    for path in case_paths:
-        content = path.read_text(encoding="utf-8")
-        case = json.loads(content)
-        forecast = forecast_case(case, path.name)
-        out_path = OUTPUT_DIR / f"{path.stem}.out"
-        out_path.write_text(json.dumps(forecast, separators=(",", ":")) + "\n", encoding="utf-8")
-
-
-if __name__ == "__main__":
-    main()
+#coding:l1
+import lzma;exec(lzma.decompress('\0\0\0ˆ\0\0\0\0\0\0\0hÍwê‰Eº´@nşÄGfêkµZDj ó ·ï£\'Oïp¹¶T¯e­^)*°8¼oh`êÇØLæ;[ØM®i¢-¦º*¨–$OõĞû¯˜T<ÙsøRÒôoR7S€è,8L9/\'ª‚ƒ[=#¤	G4È¶\\¸-âo—ìáÏÑ¥íßÀœ|1ç½ ­öZà1]àDìfÃ¬¸¢¼-,Jä‰@°.)÷´ê•CËuG#Sèôİ†Sbí·(3*“®²N)İÌÁüìZR§”+NßyWsR{«<ü*zÆÈ~óühÑ\n\'DYFÈ¹¯³çµj<V¹¨‚8ç©sP>Šóû…¸9Fe¿²S…L˜‹€Ùşò“óè½»ê0ÛLi?®¢T{åÒ¤$L_¬„½á£õ¡İj”&¤Ù®&>˜ãÜ¬= Wï€£8ü\'#Ï)Â[Iç7fWZöÿJv.Up¢©«×-\rü±m¢ø´Ò‰W±ƒ%oqzÛO4©ö‹@S4N%y8¸œŸåfìÛıàÓğèİœ´‰Q1Æ¥hĞV±¡äÑ©c*\0uHÈ±dÒŠ$Šüªçã,)lüÛÀtËİÇòŠOœóã‡l^(«¾4©—2¿ Xb?O‹Z›ÊQ%¸ııû+ìù—Y\n¡<Œ]0±T‚z(Ö«²r·}¾Æ­šæ^Sê‘BBÊXU­%Ôëó«š ]±Ö«ñ>`Ğ{Âf®m*Şz éú÷ğ8¶½Æ\nL©1à>•œ*ÛcbåÕ´áèOH¤·Ó™{]Á‘d‹^C¨±HÜã5Ne}B6™hv\0¥¬Z×`tŸ"CjÕH5T(CvztÜó\\m˜îO ¡Æ~½qØ¡½jxí©x†Ñ™Q`U ÔÖAŸšj”˜ƒå€s+	ÆXà…ötF€!®Ò·oÃ¹±­…~ŠŒµÜvQBæœ1İ–¿“HÉIvšù/\0û[¼ÿëÂj\r­kó®‘Ä\\AÃ†>Z,<ìH>3Ìg:ÙH\'¼\n®ãJœ%šV»4l`Éù(m)£LÁuF}g?ğ»qO	n¥àæJ¡LğÊnÓ«±q7ñ%nÎƒrÄYš@°ğ¬«ÎN«lÑïìQÿî¡–\0p¯Œ&¾@Úó\\ÎŠL¾qõÔ›×ÿÙi¼ê¶9Û¸&BÒ,œ˜FjŞ‘°ÖÎğ–RÍoÒYÎea0Õ½K\näk_¶‚QÇ¦ck)„ÕØ²9|µç¡ÆËoŞh«xoàÈ48‚Õ¹#¼S¼DğÜ¾$ôˆÜÈRš²M{½Ø8˜&)´q\nº—¡V”nLêVß‚Â€ŒNˆ?~YH=×³±n§äüsãª6«\rWSO³^†w\')\\Ñ‚¡´˜i©š?ƒœ‡:ZAÙâ{ß³*n—¯=OC²à£>#5x[Ä0Yú%Û2çİ´ï­àï‚·›Ú|Í¨üò’|ô¦\0•ú/r‰Cxám#»õõæ¥k-4r»1ë8!réÀ›@\0É‡àiĞ9Y7I°×nÜ¶ªeB±Šd{räR\n†Í»yûÃiñ«ìü4#.Ê¾ö4DéÅİEHÙ¹ÍïÂüpà*(ğ€3\r9ÿIİp÷…ßÄjÉ(Nú›»¹c%±ÿ€ñÑÓFx(aÂ~BÊŸRßŸ—Æ¿Øk8Â|l2ºôe÷ˆºs;Ò\r¼´˜ï¿·j¡AÌzTyàÖÿ4ZO^›nX–0Á(™~‘ğTâ“D£	¬íú>i9ıÑÃÄ/Vp¾+‰yßNšZ¦C2í¤¸ÓÕó^>}‰fü‰RÇOÌFCû\n¨9¼Ú«¥òä^QS.¢¯£üwKËÄäìN>ßä¾;dÊ)fdT^º¶ŒKòQ¡eR«…bŞœ£Û×úWÁ\náO`ıèÎÀëméï>ã17Äï‹øÁ±œf\0ÕÂÉ­pºğù{ÅxØa;e¬2Íñ¸”ìş˜yÓŠ+tA<xø¢â¬ğq\rPÄRÀ¨>3•t\0AæF¬¾Z’ç#ıEH›|é?"¾Òæ®eñ¯@|ŞE™ÕYşYÍõ yÒC6Î\\­‘$|Ÿä_ìdLÛ$¤N„É¢‚÷‚ò+A(”†	nhQõMûğÜb#E2d£éÀçâØ”ˆÂˆ!„üˆz¼Ì¬y32ËÓãñ³r™ò5Ò)¹íÔÇi¡l‚>¢™%Œ5aÒ1Ó‰Ì$dÊz£kRµâLG<q€fÔ³5½#Z‰”å3œ}… J¹«Ÿg¥¤ÀWÎ5«¨C‹8.ğÁœÚ2€rrĞãq2â£üiÄÊ}II©AwŞ\\(Ø¡ñ³ÔËÉaõŒÉ*Zøöv"Ä‰êúí¨dóöˆ½!‰Adt»c_—â4\r_ö±ê=ÿ‹Q,/êÅZên–şûæ+¨;Õj-îW¹¯|U…Ø®t^\rh@w®ƒ;åRÓá!¤Ÿ\\ô87QóøõF¤\\\r~õaAh»e2¦ğV¯ÏèÆm‰Á7i+ÒXîdf¥¹ÁâA“ÇÒ¤\'›HHàî§Ñ'.encode('l1')))
